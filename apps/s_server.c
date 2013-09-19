@@ -152,6 +152,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cvp2_dtcp.h"
+#include "s_dtcp_interface.h"
+
+
 #include <openssl/e_os2.h>
 #ifdef OPENSSL_NO_STDIO
 #define APPS_WIN16
@@ -226,16 +230,24 @@ static void s_server_init(void);
 #endif
 
 #ifndef OPENSSL_NO_TLSEXT
+static int suppdata_requires_renegotiation(unsigned char *peer_suppdata_x509, unsigned short peer_suppdata_x509_length, X509* peer_cert);
 
-static const unsigned char auth_ext_data[]={TLSEXT_AUTHZDATAFORMAT_dtcp};
+static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *suppdata_len, X509* cert);
+static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short suppdata_len);
 
-static unsigned char *generated_supp_data = NULL;
+//length and type
+static const unsigned char auth_ext_data[]={1, TLSEXT_AUTHZDATAFORMAT_dtcp};
 
-static const unsigned char *most_recent_supplemental_data = NULL;
-static size_t most_recent_supplemental_data_length = 0;
+static unsigned char *g_most_recent_supplemental_data = 0;
+static size_t g_most_recent_supplemental_data_length = 0;
+static unsigned char g_most_recent_nonce[32];
+static unsigned char *g_most_recent_peer_suppdata_x509 = 0;
+static size_t g_most_recent_peer_suppdata_x509_length = 0;
 
 static int client_provided_server_authz = 0;
 static int client_provided_client_authz = 0;
+
+static unsigned char *suppdata_to_send = NULL;
 
 #endif
 
@@ -331,28 +343,30 @@ static int cert_chain = 0;
 
 #ifndef OPENSSL_NO_TLSEXT
 static int suppdata_cb(SSL *s, unsigned short supp_data_type,
-		       const unsigned char *in,
-		       unsigned short inlen, int *al,
-		       void *arg);
+        const unsigned char *in,
+        unsigned short inlen, int *al,
+        void *arg);
 
 static int auth_suppdata_generate_cb(SSL *s, unsigned short supp_data_type,
-				     const unsigned char **out,
-				     unsigned short *outlen, int *al, void *arg);
+        const unsigned char **out,
+        unsigned short *outlen, int *al, void *arg);
 
 static int authz_tlsext_generate_cb(SSL *s, unsigned short ext_type,
-				    const unsigned char **out, unsigned short *outlen,
-				    int *al, void *arg);
+        const unsigned char **out, unsigned short *outlen, int *al,
+        void *arg);
 
 static int authz_tlsext_cb(SSL *s, unsigned short ext_type,
-			   const unsigned char *in,
-			   unsigned short inlen, int *al,
-			   void *arg);
+        const unsigned char *in,
+        unsigned short inlen, int *al,
+        void *arg);
 
 static BIO *serverinfo_in = NULL;
 static const char *s_serverinfo_file = NULL;
 
-static int c_auth = 0;
+static int c_dtcp = 0;
 static int c_auth_require_reneg = 0;
+static int c_dtcp_send_certs = 0;
+static int g_bRandonNumInitialized = 0;
 #endif
 
 #ifndef OPENSSL_NO_PSK
@@ -515,8 +529,11 @@ static void sv_usage(void)
 	BIO_printf(bio_err,"                 (default is %s)\n",TEST_CERT);
 #ifndef OPENSSL_NO_TLSEXT
 	BIO_printf(bio_err," -serverinfo arg - PEM serverinfo file for certificate\n");
-	BIO_printf(bio_err," -auth               - send and receive RFC 5878 TLS auth extensions and supplemental data\n");
-	BIO_printf(bio_err," -auth_require_reneg - Do not send TLS auth extensions until renegotiation\n");
+    BIO_printf(bio_err," -dtcp               - send and receive RFC 5878 DTCP TLS auth extensions and supplemental data\n");
+    BIO_printf(bio_err," -auth_require_reneg - Do not send TLS auth extensions until renegotiation\n");
+    BIO_printf(bio_err," -dtcp_dll_path          -  Full path to the dll containing the DTCP implementation\n");
+    BIO_printf(bio_err," -dtcp_key_storage_dir   -  Full path to the directory containing the DTCP keys\n");
+    BIO_printf(bio_err," -dtcp_send_certs   -  Send the server's DTCP cert and X509 cert in the DTCP TLS auth supplemental data entry\n");
 #endif
     BIO_printf(bio_err," -no_resumption_on_reneg - set SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION flag\n");
 	BIO_printf(bio_err," -crl_check    - check the peer certificate has not been revoked by its CA.\n" \
@@ -613,7 +630,6 @@ static void sv_usage(void)
 	BIO_printf(bio_err," -nextprotoneg arg - set the advertised protocols for the NPN extension (comma-separated list)\n");
 # endif
         BIO_printf(bio_err," -use_srtp profiles - Offer SRTP key management with a colon-separated profile list\n");
-	BIO_printf(bio_err," -alpn arg  - set the advertised protocols for the ALPN extension (comma-separated list)\n");
 #endif
 	BIO_printf(bio_err," -keymatexport label   - Export keying material using label\n");
 	BIO_printf(bio_err," -keymatexportlen len  - Export len bytes of keying material (default 20)\n");
@@ -968,48 +984,7 @@ static int next_proto_cb(SSL *s, const unsigned char **data, unsigned int *len, 
 	return SSL_TLSEXT_ERR_OK;
 	}
 # endif  /* ndef OPENSSL_NO_NEXTPROTONEG */
-
-/* This the context that we pass to alpn_cb */
-typedef struct tlsextalpnctx_st {
-	unsigned char *data;
-	unsigned short len;
-} tlsextalpnctx;
-
-static int alpn_cb(SSL *s, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned int inlen, void *arg)
-	{
-	tlsextalpnctx *alpn_ctx = arg;
-
-	if (!s_quiet)
-		{
-		/* We can assume that |in| is syntactically valid. */
-		unsigned i;
-		BIO_printf(bio_s_out, "ALPN protocols advertised by the client: ");
-		for (i = 0; i < inlen; )
-			{
-			if (i)
-				BIO_write(bio_s_out, ", ", 2);
-			BIO_write(bio_s_out, &in[i + 1], in[i]);
-			i += in[i] + 1;
-			}
-		BIO_write(bio_s_out, "\n", 1);
-		}
-
-	if (SSL_select_next_proto((unsigned char**) out, outlen, alpn_ctx->data, alpn_ctx->len, in, inlen) !=
-	    OPENSSL_NPN_NEGOTIATED)
-		{
-		return SSL_TLSEXT_ERR_NOACK;
-		}
-
-	if (!s_quiet)
-		{
-		BIO_printf(bio_s_out, "ALPN protocols selected: ");
-		BIO_write(bio_s_out, *out, *outlen);
-		BIO_write(bio_s_out, "\n", 1);
-		}
-
-	return SSL_TLSEXT_ERR_OK;
-	}
-#endif  /* ndef OPENSSL_NO_TLSEXT */
+#endif
 
 static int not_resumable_sess_cb(SSL *s, int is_forward_secure)
 	{
@@ -1051,6 +1026,7 @@ int MAIN(int argc, char *argv[])
 	char *inrand=NULL;
 	int s_cert_format = FORMAT_PEM, s_key_format = FORMAT_PEM;
 	char *passarg = NULL, *pass = NULL;
+    char *dtcp_dll_file=NULL, *dtcp_key_storage_path=NULL;
 	char *dpassarg = NULL, *dpass = NULL;
 	int s_dcert_format = FORMAT_PEM, s_dkey_format = FORMAT_PEM;
 	X509 *s_cert = NULL, *s_dcert = NULL;
@@ -1058,7 +1034,7 @@ int MAIN(int argc, char *argv[])
 	EVP_PKEY *s_key = NULL, *s_dkey = NULL;
 	int no_cache = 0, ext_cache = 0;
 	int rev = 0, naccept = -1;
-	int c_no_resumption_on_reneg = 0;
+    int c_no_resumption_on_reneg = 0;
 #ifndef OPENSSL_NO_TLSEXT
 	EVP_PKEY *s_key2 = NULL;
 	X509 *s_cert2 = NULL;
@@ -1066,8 +1042,6 @@ int MAIN(int argc, char *argv[])
 # ifndef OPENSSL_NO_NEXTPROTONEG
 	const char *next_proto_neg_in = NULL;
 	tlsextnextprotoctx next_proto;
-	const char *alpn_in = NULL;
-	tlsextalpnctx alpn_ctx = { NULL, 0};
 # endif
 #endif
 #ifndef OPENSSL_NO_PSK
@@ -1178,19 +1152,33 @@ int MAIN(int argc, char *argv[])
 			if (--argc < 1) goto bad;
 			s_serverinfo_file = *(++argv);
 			}
-		else if	(strcmp(*argv,"-auth") == 0)
+        else if	(strcmp(*argv,"-dtcp") == 0)
+            {
+            c_dtcp = 1;
+            }
+        else if	(strcmp(*argv,"-dtcp_dll_path") == 0)
 			{
-			c_auth = 1;
+			if (--argc < 1) goto bad;
+			dtcp_dll_file= *(++argv);
 			}
+        else if	(strcmp(*argv,"-dtcp_key_storage_dir") == 0)
+			{
+			if (--argc < 1) goto bad;
+			dtcp_key_storage_path= *(++argv);
+			}
+        else if	(strcmp(*argv,"-dtcp_send_certs") == 0)
+            {
+            c_dtcp_send_certs = 1;
+            }
 #endif
-		else if (strcmp(*argv, "-no_resumption_on_reneg") == 0)
-			{
-			c_no_resumption_on_reneg = 1;
-			}
-		else if	(strcmp(*argv,"-auth_require_reneg") == 0)
-			{
-			c_auth_require_reneg = 1;
-			}
+        else if (strcmp(*argv, "-no_resumption_on_reneg") == 0)
+            {
+                c_no_resumption_on_reneg = 1;
+            }
+        else if	(strcmp(*argv,"-auth_require_reneg") == 0)
+            {
+            c_auth_require_reneg = 1;
+            }
 		else if	(strcmp(*argv,"-certform") == 0)
 			{
 			if (--argc < 1) goto bad;
@@ -1525,11 +1513,6 @@ int MAIN(int argc, char *argv[])
 			if (--argc < 1) goto bad;
 			next_proto_neg_in = *(++argv);
 			}
-		else if	(strcmp(*argv,"-alpn") == 0)
-			{
-			if (--argc < 1) goto bad;
-			alpn_in = *(++argv);
-			}
 # endif
 #endif
 #if !defined(OPENSSL_NO_JPAKE) && !defined(OPENSSL_NO_PSK)
@@ -1657,8 +1640,7 @@ bad:
 #endif /* OPENSSL_NO_TLSEXT */
 		}
 
-#if !defined(OPENSSL_NO_TLSEXT)
-# if !defined(OPENSSL_NO_NEXTPROTONEG) 
+#if !defined(OPENSSL_NO_TLSEXT) && !defined(OPENSSL_NO_NEXTPROTONEG) 
 	if (next_proto_neg_in)
 		{
 		unsigned short len;
@@ -1670,16 +1652,6 @@ bad:
 	else
 		{
 		next_proto.data = NULL;
-		}
-# endif
-	alpn_ctx.data = NULL;
-	if (alpn_in)
-		{
-		unsigned short len;
-		alpn_ctx.data = next_protos_parse(&len, alpn_in);
-		if (alpn_ctx.data == NULL)
-			goto end;
-		alpn_ctx.len = len;
 		}
 #endif
 
@@ -1915,8 +1887,6 @@ bad:
 	if (next_proto.data)
 		SSL_CTX_set_next_protos_advertised_cb(ctx, next_proto_cb, &next_proto);
 # endif
-	if (alpn_ctx.data)
-		SSL_CTX_set_alpn_select_cb(ctx, alpn_cb, &alpn_ctx);
 #endif 
 
 #ifndef OPENSSL_NO_DH
@@ -1963,20 +1933,43 @@ bad:
 		}
 #endif
 
-	if (c_no_resumption_on_reneg)
-		SSL_CTX_set_options(ctx, SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+    if (c_no_resumption_on_reneg)
+        {
+        SSL_CTX_set_options(ctx, SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+        }
 	if (!set_cert_key_stuff(ctx, s_cert, s_key, s_chain, build_chain))
 		goto end;
 #ifndef OPENSSL_NO_TLSEXT
 	if (s_serverinfo_file != NULL
 	    && !SSL_CTX_use_serverinfo_file(ctx, s_serverinfo_file))
 		goto end;
-	if (c_auth)
-		{
-		SSL_CTX_set_custom_srv_ext(ctx, TLSEXT_TYPE_client_authz, authz_tlsext_cb, authz_tlsext_generate_cb, bio_err);
-		SSL_CTX_set_custom_srv_ext(ctx, TLSEXT_TYPE_server_authz, authz_tlsext_cb, authz_tlsext_generate_cb, bio_err);
-		SSL_CTX_set_srv_supp_data(ctx, TLSEXT_SUPPLEMENTALDATATYPE_authz_data, auth_suppdata_generate_cb, suppdata_cb, bio_err);
-		}
+    if (c_dtcp)
+        {
+        int ret = 0;
+        SSL_CTX_set_custom_srv_ext(ctx, TLSEXT_TYPE_client_authz, authz_tlsext_cb, authz_tlsext_generate_cb, bio_err);
+        SSL_CTX_set_custom_srv_ext(ctx, TLSEXT_TYPE_server_authz, authz_tlsext_cb, authz_tlsext_generate_cb, bio_err);
+        SSL_CTX_set_srv_supp_data(ctx, TLSEXT_SUPPLEMENTALDATATYPE_authz_data, auth_suppdata_generate_cb, suppdata_cb, bio_err);
+
+        // init DTCP DLL here
+        if (dtcp_dll_file == NULL)
+            {
+            BIO_printf(bio_err,"DTCP DLL path not specified -- use option -dtcp_dll_path\n");
+            goto end;
+            }
+
+        if (dtcp_key_storage_path == NULL)
+            {
+            BIO_printf(bio_err,"DTCP Key Storage path not specified -- use option -dtcp_key_storage_dir\n");
+            goto end;
+            }
+
+        ret = initDTCP(dtcp_dll_file, dtcp_key_storage_path);
+        if (ret != 0)
+            {
+            BIO_printf(bio_err,"DTCP initialization failed with error %d\n", ret);
+            goto end;
+            }
+        }
 #endif
 #ifndef OPENSSL_NO_TLSEXT
 	if (ctx2 && !set_cert_key_stuff(ctx2,s_cert2,s_key2, NULL, build_chain))
@@ -2156,10 +2149,6 @@ end:
 		EVP_PKEY_free(s_key2);
 	if (serverinfo_in != NULL)
 		BIO_free(serverinfo_in);
-	if (next_proto.data)
-		OPENSSL_free(next_proto.data);
-	if (alpn_ctx.data)
-		OPENSSL_free(alpn_ctx.data);
 #endif
 	ssl_excert_free(exc);
 	if (ssl_args)
@@ -2406,7 +2395,7 @@ static int sv_body(char *hostname, int s, int stype, unsigned char *context)
 
 			if ((SSL_version(con) == DTLS1_VERSION) && DTLSv1_handle_timeout(con) > 0)
 				{
-				BIO_printf(bio_err,"TIMEOUT occurred\n");
+				BIO_printf(bio_err,"TIMEOUT occured\n");
 				}
 
 			if (i <= 0) continue;
@@ -2447,8 +2436,8 @@ static int sv_body(char *hostname, int s, int stype, unsigned char *context)
 				if ((i <= 0) || (buf[0] == 'Q'))
 					{
 					BIO_printf(bio_s_out,"DONE\n");
-					SHUTDOWN(s);
-					close_accept_socket();
+                    SHUTDOWN(s);
+                    close_accept_socket();
 					ret= -11;
 					goto err;
 					}
@@ -2660,7 +2649,7 @@ static int init_ssl_connection(SSL *con)
 	unsigned next_proto_neg_len;
 #endif
 	unsigned char *exportedkeymat;
-
+    int renegotiate_required = 0;
 
 	i=SSL_accept(con);
 #ifndef OPENSSL_NO_SRP
@@ -2675,13 +2664,6 @@ static int init_ssl_connection(SSL *con)
 			i=SSL_accept(con);
 		}
 #endif
-	/*handshake is complete - free the generated supp data allocated in the callback */
-	if (generated_supp_data)
-		{
-        OPENSSL_free(generated_supp_data);
-		generated_supp_data = NULL;
-		}
-
 	if (i <= 0)
 		{
 		if (BIO_sock_should_retry(i))
@@ -2710,6 +2692,20 @@ static int init_ssl_connection(SSL *con)
 	peer=SSL_get_peer_certificate(con);
 	if (peer != NULL)
 		{
+   		BIO_printf(bio_s_out,"Client certificate was provided\n");
+        if (c_dtcp && !SSL_num_renegotiations(con))
+            {
+            renegotiate_required = (! ( client_provided_client_authz && client_provided_server_authz) || suppdata_requires_renegotiation(g_most_recent_peer_suppdata_x509, g_most_recent_peer_suppdata_x509_length, peer));
+            if (renegotiate_required == 1)
+                {
+                    BIO_printf(bio_s_out,"Triggering renegotiation due to supplemental data not containing X509\n");
+                }
+            if (renegotiate_required == -1)
+                {
+                    BIO_printf(bio_s_out,"Supplemental data x509 did not pass validation\n");
+                    return 0;
+                }
+            }
 		BIO_printf(bio_s_out,"Client certificate\n");
 		PEM_write_bio_X509(bio_s_out,peer);
 		X509_NAME_oneline(X509_get_subject_name(peer),buf,sizeof buf);
@@ -2718,15 +2714,21 @@ static int init_ssl_connection(SSL *con)
 		BIO_printf(bio_s_out,"issuer=%s\n",buf);
 		X509_free(peer);
 		}
+    else
+        {
+        BIO_printf(bio_s_out,"Peer certificate was not provided\n");
+        if (!SSL_cache_hit(con))
+            {
+            renegotiate_required = 1;
+            }
+        }
 
 	if (SSL_get_shared_ciphers(con,buf,sizeof buf) != NULL)
 		BIO_printf(bio_s_out,"Shared ciphers:%s\n",buf);
 	str=SSL_CIPHER_get_name(SSL_get_current_cipher(con));
 	ssl_print_sigalgs(bio_s_out, con);
-#ifndef OPENSSL_NO_EC
 	ssl_print_point_formats(bio_s_out, con);
 	ssl_print_curves(bio_s_out, con, 0);
-#endif
 	BIO_printf(bio_s_out,"CIPHER is %s\n",(str != NULL)?str:"(NONE)");
 
 #if !defined(OPENSSL_NO_TLSEXT) && !defined(OPENSSL_NO_NEXTPROTONEG)
@@ -2790,6 +2792,17 @@ static int init_ssl_connection(SSL *con)
 			}
 		}
 
+    if (renegotiate_required == 1)
+       {
+       SSL_renegotiate(con);
+       BIO_printf(bio_s_out, "SSL_renegotiate -> %d\n",i);
+       SSL_do_handshake(con);
+       }
+    if (renegotiate_required < 0)
+       {
+       return renegotiate_required;
+       }
+
 	return(1);
 	}
 
@@ -2828,6 +2841,53 @@ static int load_CA(SSL_CTX *ctx, char *file)
 	return(1);
 	}
 #endif
+
+/*
+ Return codes:
+ 0: Renegotiation not required
+ 1: Renegotiation required
+ -1: Error or certs do not match
+*/
+static int suppdata_requires_renegotiation(unsigned char *peer_suppdata_x509, unsigned short peer_suppdata_length, X509 *peercert)
+    {
+    unsigned char *peer_cert_data, *p;
+    int peer_cert_length, i;
+    if (peer_suppdata_x509 == NULL || peercert == NULL)
+        {
+        BIO_printf(bio_s_out, "suppdata_requires_renegotiation: peer x509 cert or suppdata x509 cert not received - renegotiation required\n");
+        return 1;
+        }
+
+    peer_cert_length = i2d_X509(peercert, NULL);
+
+    //compare the known peer cert from the client with the cert received in the supplemental data message
+
+    if (peer_suppdata_length != peer_cert_length)
+        {
+        BIO_printf(bio_s_out, "suppdata_requires_renegotiation: validation failed: non-matching x509 cert sizes: %d, %d\n", peer_suppdata_length, peer_cert_length);
+        return -1;
+        }
+
+    peer_cert_data = OPENSSL_malloc(peer_cert_length);
+    if (peer_cert_data == NULL)
+        {
+        BIO_printf(bio_s_out, "suppdata_requires_renegotiation: Unable to allocate buffer for x509 cert data\n");
+        return -1;
+        }
+
+    p = peer_cert_data;
+    i2d_X509(peercert, &p);
+
+    for (i=0; i<peer_cert_length; i++)
+        {
+        if (peer_cert_data[i] != peer_suppdata_x509[i])
+            {
+            BIO_printf(bio_s_out, "suppdata_requires_renegotiation: validation failed: invalid x509 peer cert: %d, %x, %x\n", i, peer_cert_data[i], peer_suppdata_x509[i]);
+            return -1;
+            }
+        }
+    return 0;
+    }
 
 static int www_body(char *hostname, int s, int stype, unsigned char *context)
 	{
@@ -3069,9 +3129,7 @@ static int www_body(char *hostname, int s, int stype, unsigned char *context)
 				BIO_puts(io,"\n");
 				}
 			ssl_print_sigalgs(io, con);
-#ifndef OPENSSL_NO_EC
 			ssl_print_curves(io, con, 0);
-#endif
 			BIO_printf(io,(SSL_cache_hit(con)
 				?"---\nReused, "
 				:"---\nNew, "));
@@ -3571,74 +3629,364 @@ static void free_sessions(void)
 
 #ifndef OPENSSL_NO_TLSEXT
 static int authz_tlsext_cb(SSL *s, unsigned short ext_type,
-			   const unsigned char *in,
-			   unsigned short inlen, int *al,
-			   void *arg)
-	{
-	if (TLSEXT_TYPE_server_authz == ext_type)
-		client_provided_server_authz
-		  = memchr(in,	TLSEXT_AUTHZDATAFORMAT_dtcp, inlen) != NULL;
+        const unsigned char *in,
+        unsigned short inlen, int *al,
+        void *arg)
+    {
+    if (TLSEXT_TYPE_server_authz == ext_type)
+        {
+        client_provided_server_authz = (memchr(in,
+                TLSEXT_AUTHZDATAFORMAT_dtcp,
+                inlen) != NULL);
+        }
 
-	if (TLSEXT_TYPE_client_authz == ext_type)
-		client_provided_client_authz
-		  = memchr(in, TLSEXT_AUTHZDATAFORMAT_dtcp, inlen) != NULL;
+    if (TLSEXT_TYPE_client_authz == ext_type)
+        {
+        client_provided_client_authz = (memchr(in,
+                TLSEXT_AUTHZDATAFORMAT_dtcp,
+                inlen) != NULL);
+        }
 
-	return 1;
-	}
+    return 1;
+    }
 
 static int authz_tlsext_generate_cb(SSL *s, unsigned short ext_type,
-				    const unsigned char **out, unsigned short *outlen,
-				    int *al, void *arg)
-	{
-	if (c_auth && client_provided_client_authz && client_provided_server_authz)
-		{
-		/*if auth_require_reneg flag is set, only send extensions if
-		  renegotiation has occurred */
-		if (!c_auth_require_reneg
-		    || (c_auth_require_reneg && SSL_num_renegotiations(s)))
-			{
-			*out = auth_ext_data;
-			*outlen = 1;
-			return 1;
-			}
-		}
-	/* no auth extension to send */
-	return -1;
-	}
+        const unsigned char **out, unsigned short *outlen, int *al,
+        void *arg)
+    {
+    if (c_dtcp && client_provided_client_authz && client_provided_server_authz)
+        {
+        if (!c_auth_require_reneg || (c_auth_require_reneg && SSL_num_renegotiations(s)))
+            {
+            *out = auth_ext_data;
+            *outlen = sizeof(auth_ext_data);
+            return 1;
+            }
+        }
+    //no auth extension to send
+    return -1;
+    }
 
 static int suppdata_cb(SSL *s, unsigned short supp_data_type,
-		       const unsigned char *in,
-		       unsigned short inlen, int *al,
-		       void *arg)
-	{
-	if (supp_data_type == TLSEXT_SUPPLEMENTALDATATYPE_authz_data)
-		{
-		most_recent_supplemental_data = in;
-		most_recent_supplemental_data_length = inlen;
-		}
-	return 1;
-	}
+        const unsigned char *in,
+        unsigned short inlen, int *al,
+        void *arg)
+    {
+    int ret = 0;
+    if (supp_data_type == TLSEXT_SUPPLEMENTALDATATYPE_authz_data)
+        {
+        g_most_recent_supplemental_data = OPENSSL_malloc (sizeof(char *) * inlen);
+        if (g_most_recent_supplemental_data == NULL)
+            {
+            BIO_printf(bio_s_out, "failed to allocate memory for most recent supplemental data\n");
+            return 0;
+            }
+        memcpy (g_most_recent_supplemental_data, in, inlen);
+
+        g_most_recent_supplemental_data_length = inlen;
+
+        ret = validate_dtcp_suppdata(g_most_recent_supplemental_data, g_most_recent_supplemental_data_length);
+        if (ret != 0)
+            {
+            BIO_printf(bio_s_out, "client supplemental data failed validation - %d\n", ret);
+            *al = SSL_AD_DECODE_ERROR;
+            OPENSSL_free(g_most_recent_supplemental_data);
+            g_most_recent_supplemental_data = NULL;
+            g_most_recent_supplemental_data_length = 0;
+            return 0;
+            }
+        }
+    return 1;
+    }
 
 static int auth_suppdata_generate_cb(SSL *s, unsigned short supp_data_type,
-				     const unsigned char **out,
-				     unsigned short *outlen, int *al, void *arg)
-	{
-	if (c_auth && client_provided_client_authz && client_provided_server_authz)
-		{
-		/*if auth_require_reneg flag is set, only send supplemental data if
-		  renegotiation has occurred */
-		if (!c_auth_require_reneg
-		    || (c_auth_require_reneg && SSL_num_renegotiations(s)))
-			{
-			generated_supp_data = OPENSSL_malloc(10);
-			memcpy(generated_supp_data, "1234512345", 10);
-			*out = generated_supp_data;
-			*outlen = 10;
-			return 1;
-			}
-		}
-	/* no supplemental data to send */
-	return -1;
-	}
+        const unsigned char **out,
+        unsigned short *outlen, int *al, void *arg)
+    {
+    if (c_dtcp && client_provided_client_authz && client_provided_server_authz)
+        {
+        if (!c_auth_require_reneg || (c_auth_require_reneg && SSL_num_renegotiations(s)))
+            {
+                int ret = 0;
+                X509 *cert = NULL;
+                //send dtcp supplemental data                          
+                cert = SSL_get_certificate(s);
+                ret = format_dtcp_suppdata(out, outlen, cert);
+                if (ret != 0)
+                {
+                    BIO_printf(bio_s_out, "failed to generate supplemental data - %d\n", ret);
+                    return 0;
+                }
+                return 1;
+            }
+        }
+    //no supplemental data to send
+    return -1;
+    }
+
+static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *suppdata_len, X509 *cert)
+    {
+    unsigned int pSignOffset = 0;
+    unsigned int uNumBytesToSign = 0;
+    int ret = 0;
+    unsigned char pLocalCert[1000];
+    unsigned int uLocalCertSize = 1000;
+    unsigned char pSignature[1000];
+    unsigned int uSignatureSize = 1000;
+    unsigned char *x509Cert = NULL;
+    unsigned char *p = NULL;
+    int x509CertLength;
+    size_t i = 0;
+    size_t index = 0;
+    unsigned short encodedLength = 0;
+
+    //type, length and nonce
+    suppdata_to_send=OPENSSL_malloc(sizeof(char *) * (1 + 2 + 32));
+    if (suppdata_to_send == NULL)
+        {
+        BIO_printf(bio_s_out, "failed to allocate memory for supplemental data\n");
+        goto err;
+        }
+
+    suppdata_to_send[0] = TLSEXT_AUTHZDATAFORMAT_dtcp;
+    index += 3;
+
+    // generate nonce and persist it for later validation
+    if (g_bRandonNumInitialized == 0)
+        {
+        srand((unsigned)time(NULL));
+        g_bRandonNumInitialized = 1;
+        }
+    for (i=0; i<8; i++)
+        {
+        int randonNum = rand();
+        memcpy (g_most_recent_nonce + 4*i, &randonNum, 4);
+        }
+
+    memcpy (suppdata_to_send + index, g_most_recent_nonce, 32);
+    index += 32;
+
+    if (c_dtcp_send_certs && cert)
+        {
+        ret = DTCPIPAuth_GetLocalCert (pLocalCert, &uLocalCertSize);
+        if (ret != 0)
+            {
+            BIO_printf(bio_s_out, "failed to retrieve local cert: %d\n", ret);
+            goto err;
+            }
+
+        suppdata_to_send = OPENSSL_realloc(suppdata_to_send,
+        sizeof(char *)*index + sizeof(char *)*uLocalCertSize + sizeof(char *)*2);
+        if (suppdata_to_send == NULL)
+            {
+            BIO_printf(bio_s_out, "failed to allocate memory for supplemental data\n");
+            goto err;
+            }
+
+        pSignOffset = index;
+        uNumBytesToSign = 2 + uLocalCertSize;
+    
+        /*add DTCP cert size*/
+        suppdata_to_send[index++] = (uLocalCertSize >> 8) & 0xff;
+        suppdata_to_send[index++] = uLocalCertSize & 0xff;
+    
+        memcpy (suppdata_to_send + index, pLocalCert, uLocalCertSize);
+        index += uLocalCertSize;
+            
+        x509CertLength = i2d_X509(cert, NULL);
+        x509Cert = OPENSSL_malloc(x509CertLength);
+        if (x509Cert == NULL)
+            {
+            BIO_printf(bio_s_out, "failed to allocate memory for x509 cert data\n");
+            goto err;
+            }
+        suppdata_to_send = OPENSSL_realloc(suppdata_to_send,
+            sizeof(char *)*index + sizeof(char *)*x509CertLength + sizeof(char *)*2);
+        if (suppdata_to_send == NULL)
+            {
+            BIO_printf(bio_s_out, "failed to allocate memory for supplemental data\n");
+            goto err;
+            }
+
+        /*add x509 cert size*/
+        suppdata_to_send[index++] = (x509CertLength >> 8) & 0xff;
+        suppdata_to_send[index++] = x509CertLength & 0xff;
+
+        p = x509Cert;
+        i2d_X509(cert, &p);
+        memcpy (suppdata_to_send + index, x509Cert, x509CertLength);
+        index += x509CertLength;
+        uNumBytesToSign += 2 + x509CertLength;
+
+        ret =  DTCPIPAuth_SignData(suppdata_to_send + pSignOffset, uNumBytesToSign, pSignature,
+                &uSignatureSize);
+
+        if (ret != 0)
+            {
+            BIO_printf(bio_s_out, "failed to sign data: %d\n", ret);
+            goto err;
+            }
+
+        suppdata_to_send = OPENSSL_realloc(suppdata_to_send, 
+            sizeof(char *)*index + sizeof(char *)*uSignatureSize);
+        if (suppdata_to_send == NULL)
+            {
+            printf("failed to allocate memory for supplemental data\n");
+            goto err;
+            }
+        memcpy (suppdata_to_send + index, pSignature, uSignatureSize);
+        index += uSignatureSize;
+        }
+     else
+        {
+            //set dtcp and x509 cert lengths to zero
+            suppdata_to_send[index++] = 0;
+            suppdata_to_send[index++] = 0;
+            suppdata_to_send[index++] = 0;
+            suppdata_to_send[index++] = 0;
+        }
+
+    *suppdata_len = index;
+
+    // fill in length
+    encodedLength = *suppdata_len - 3;
+    suppdata_to_send[1]  = encodedLength >> 8 & 0xff;
+    suppdata_to_send[2]  = encodedLength & 0xff;
+    *suppdata = suppdata_to_send;
+
+    if (x509Cert)
+        {
+        OPENSSL_free(x509Cert);
+        }
+    return 0;
+
+    err:
+    if (suppdata_to_send)
+        {
+        OPENSSL_free(suppdata_to_send);
+        suppdata_to_send = NULL;
+        }
+    if (x509Cert)
+        {
+        OPENSSL_free(x509Cert);
+        }
+    return -1;
+    }
+
+static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short suppdata_len)
+    {
+    unsigned int pSignOffset = 0;
+    size_t uNumBytesSigned = 0;
+    unsigned char *pRemoteCert = NULL;
+    size_t uRemoteCertSize = 0;
+    unsigned char pSignature[40];
+    size_t uSignatureSize = 40;
+    size_t x509Size = 0;
+    unsigned char nonce[32];
+    int ret;
+    size_t i = 0;
+        
+    //type + length
+    unsigned int index = 3;
+
+    memcpy (nonce, suppdata + index, 32);
+    index += 32;
+
+    // compare nonce to nonce sent previously
+    for (i=0; i<32; i++)
+        {
+        if (g_most_recent_nonce[i] != nonce[i])
+            {
+            BIO_printf(bio_s_out, "validate_dtcp_suppdata: validation failed: invalid nonce\n");
+            return -1;
+            }
+        }
+
+    pSignOffset = index;
+
+    //next two bytes are dtcp cert length - always sent by client
+    uRemoteCertSize = (suppdata[index] << 8) | suppdata[index+1];
+    index += 2;
+
+    uNumBytesSigned = 2 + uRemoteCertSize;
+
+    pRemoteCert = OPENSSL_malloc(uRemoteCertSize);
+
+    memcpy (pRemoteCert, suppdata + index, uRemoteCertSize);
+    index += uRemoteCertSize;
+
+    //suppdata is received before peer cert - check peer cert outside of the callback
+    x509Size = (suppdata[index] << 8) | suppdata[index+1];
+    index += 2;
+    uNumBytesSigned +=2;
+    if (x509Size > 0)
+        {
+        g_most_recent_peer_suppdata_x509 = OPENSSL_malloc(x509Size);
+        if (g_most_recent_peer_suppdata_x509 == NULL)
+            {
+            BIO_printf(bio_s_out, "failed to allocate memory for peer suppdata x509\n");
+            goto err;
+            }
+        memcpy (g_most_recent_peer_suppdata_x509, suppdata + index, x509Size);
+        g_most_recent_peer_suppdata_x509_length = x509Size;
+        index += x509Size;
+
+        uNumBytesSigned += x509Size;
+        }
+
+    memcpy (pSignature, suppdata + index, uSignatureSize);
+    index += uSignatureSize;
+
+//        printf("num signed bytes %d\n", uNumBytesSigned);
+//        printf("uSignatureSize = %d\n", uSignatureSize);
+//        for (i=0; i<uSignatureSize; i++)
+//        {
+//            printf ("0x%02x ", pSignature[i]);
+//            if (i%8 == 7)
+//            {
+//                printf ("\n");
+//            }
+//        }
+//        printf ("\n");        
+    // validate signature
+    ret =  DTCPIPAuth_VerifyData((unsigned char *)suppdata + pSignOffset, uNumBytesSigned, pSignature,
+            pRemoteCert);
+
+    if (ret != 0)
+        {
+        BIO_printf(bio_s_out, "verify data failed: %d\n", ret);
+        goto err;
+        }
+
+    // validate cert
+    ret =  DTCPIPAuth_VerifyRemoteCert(pRemoteCert);
+
+    if (ret != 0)
+        {
+        BIO_printf(bio_s_out, "verify remote cert failed: %d\n", ret);
+        goto err;
+        }
+
+    BIO_printf(bio_s_out, "DTCP validation successful\n");
+
+    if (pRemoteCert)
+        {
+        OPENSSL_free(pRemoteCert);
+        }
+    return 0;
+
+    err:
+    if (pRemoteCert)
+        {
+        OPENSSL_free(pRemoteCert);
+        }
+    if (g_most_recent_peer_suppdata_x509)
+        {
+        OPENSSL_free(g_most_recent_peer_suppdata_x509);
+        g_most_recent_peer_suppdata_x509 = NULL;
+        g_most_recent_peer_suppdata_x509_length = 0;
+        }
+    return -1;
+    }
 #endif
 
