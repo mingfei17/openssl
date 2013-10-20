@@ -3751,6 +3751,8 @@ static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *
     suppdata_to_send[0] = TLSEXT_AUTHZDATAFORMAT_dtcp;
     index += 3;
 
+    pSignOffset = index;
+
     // generate nonce and persist it for later validation
     if (g_bRandonNumInitialized == 0)
         {
@@ -3783,7 +3785,6 @@ static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *
             goto err;
             }
 
-        pSignOffset = index;
         uNumBytesToSign = 2 + uLocalCertSize;
     
         /*add DTCP cert size*/
@@ -3889,6 +3890,8 @@ static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short 
     //type + length
     unsigned int index = 3;
 
+    pSignOffset = index;
+
     memcpy (nonce, suppdata + index, 32);
     index += 32;
 
@@ -3901,8 +3904,6 @@ static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short 
             return -1;
             }
         }
-
-    pSignOffset = index;
 
     //next two bytes are dtcp cert length - always sent by client
     uRemoteCertSize = (suppdata[index] << 8) | suppdata[index+1];
