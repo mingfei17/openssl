@@ -2591,7 +2591,9 @@ static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *
     suppdata_to_send[0] = TLSEXT_AUTHZDATAFORMAT_dtcp;
     index  += 3;
 
+    //include the nonce
     pSignOffset = index;
+    uNumBytesToSign = 32;
 
     // copy nonce from server supp data to this supp data
     memcpy (suppdata_to_send + index, pServerSuppdata + 3, 32);
@@ -2613,7 +2615,7 @@ static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *
         goto err;
         }
 
-    uNumBytesToSign = 2 + uLocalCertSize;
+    uNumBytesToSign += 2 + uLocalCertSize;
 
     /*add DTCP cert size*/
     suppdata_to_send[index++] = (uLocalCertSize >> 8) & 0xff;
@@ -2729,7 +2731,10 @@ static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short 
 
     //type + length
     unsigned int index = 3;
+
+    //include the nonce
     pSignOffset = index;
+    uNumBytesSigned = 32;
 
     // skip nonce
     index += 32;
@@ -2748,7 +2753,7 @@ static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short 
 
         memcpy (pRemoteCert, suppdata + index, uRemoteCertSize);
         index += uRemoteCertSize;
-        uNumBytesSigned = 2 + uRemoteCertSize;
+        uNumBytesSigned += 2 + uRemoteCertSize;
 
         //if dtcp cert was sent, x509 is sent as well
         x509Size = (suppdata[index] << 8) | suppdata[index+1];

@@ -3751,7 +3751,9 @@ static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *
     suppdata_to_send[0] = TLSEXT_AUTHZDATAFORMAT_dtcp;
     index += 3;
 
+    //include the nonce
     pSignOffset = index;
+    uNumBytesToSign = 32;
 
     // generate nonce and persist it for later validation
     if (g_bRandonNumInitialized == 0)
@@ -3785,7 +3787,7 @@ static int format_dtcp_suppdata(const unsigned char **suppdata, unsigned short *
             goto err;
             }
 
-        uNumBytesToSign = 2 + uLocalCertSize;
+        uNumBytesToSign += 2 + uLocalCertSize;
     
         /*add DTCP cert size*/
         suppdata_to_send[index++] = (uLocalCertSize >> 8) & 0xff;
@@ -3890,7 +3892,9 @@ static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short 
     //type + length
     unsigned int index = 3;
 
+    //include the nonce
     pSignOffset = index;
+    uNumBytesSigned = 32;
 
     memcpy (nonce, suppdata + index, 32);
     index += 32;
@@ -3909,7 +3913,7 @@ static int validate_dtcp_suppdata(const unsigned char *suppdata, unsigned short 
     uRemoteCertSize = (suppdata[index] << 8) | suppdata[index+1];
     index += 2;
 
-    uNumBytesSigned = 2 + uRemoteCertSize;
+    uNumBytesSigned += 2 + uRemoteCertSize;
 
     pRemoteCert = OPENSSL_malloc(uRemoteCertSize);
 
